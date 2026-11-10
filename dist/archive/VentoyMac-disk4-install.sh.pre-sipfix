@@ -1,0 +1,199 @@
+#!/bin/bash
+# =====================================================================
+# VentoyMac generated install script
+# Target : /dev/disk4  (UDisk, 8.05 GB)
+# Version: Ventoy 1.1.18
+# Mode   : LIVE (destructive)
+# Layout : GPT / part1 LBA 2048 + 15661016, part2 LBA 15663064 + 65536
+# Build  : 2026.11.10-b5  (install script r4)
+# Source : https://github.com/ventoy/Ventoy  (INSTALL/tool/ventoy_lib.sh)
+# =====================================================================
+# 警告：本脚本会彻底清空目标磁盘上的所有数据，请在执行前逐条审阅。
+
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/bin:/sbin:/opt/homebrew/bin:$PATH
+
+# ---- Identity bootstrap (live mode only) --------------------------------
+VTOY_EUID="$(/usr/bin/id -u)"
+VTOY_RUID="$(/usr/bin/id -ru)"
+if [ "$VTOY_EUID" != "0" ]; then
+  echo "拒绝执行：未获得 root 有效权限，gpt create/add 无法运行。"; exit 1
+fi
+if [ "$VTOY_RUID" != "0" ] && [ -f "$0" ]; then
+  exec /usr/bin/python3 -c 'import os,sys; os.setuid(0); os.execv("/bin/bash",["/bin/bash",sys.argv[1]])' "$0"
+fi
+echo "身份：有效 uid=$VTOY_EUID  真实 uid=$VTOY_RUID"
+
+emit_step() { printf '\n==> [%s/%s] %s\n' "$1" "$2" "$3"; }
+ventoy_mount_point() {
+  /usr/sbin/diskutil info -plist "$1" 2>/dev/null | /usr/bin/plutil -extract MountPoint raw -o - - 2>/dev/null || true
+}
+
+VTOY_STAGE="$(/usr/bin/mktemp -d -t vtoymac-stage)"
+cleanup_stage() {
+  /bin/rm -f "$VTOY_STAGE/mbr.bin" "$VTOY_STAGE/core.bin" "$VTOY_STAGE/uuid.bin" \
+           "$VTOY_STAGE/verify.bin" "$VTOY_STAGE/verify-core.bin" "$VTOY_STAGE/gpt-capability.img"
+  /bin/rmdir "$VTOY_STAGE" 2>/dev/null || true
+}
+trap cleanup_stage EXIT
+
+echo 'VentoyMac 构建 2026.11.10-b5 · 安装脚本 r4 · 目标 /dev/disk4'
+
+emit_step 1 17 '校验目标磁盘与引导资源'
+INFO="$(/usr/sbin/diskutil info -plist '/dev/disk4')" || { echo "错误：无法读取 disk4 信息"; exit 1; }
+INTERNAL="$(printf '%s' "$INFO" | /usr/bin/plutil -extract Internal raw -o - -)"
+WHOLE="$(printf '%s' "$INFO" | /usr/bin/plutil -extract WholeDisk raw -o - -)"
+[ "$INTERNAL" = "false" ] || { echo "拒绝执行：disk4 是内置磁盘"; exit 1; }
+[ "$WHOLE" = "true" ] || { echo "拒绝执行：disk4 不是整盘设备"; exit 1; }
+for f in '/Users/daijh/Library/Application Support/VentoyMac/boot-1.1.18/boot.img' '/Users/daijh/Library/Application Support/VentoyMac/boot-1.1.18/core.img' '/Users/daijh/Library/Application Support/VentoyMac/boot-1.1.18/ventoy.disk.img'; do
+  [ -f "$f" ] || { echo "拒绝执行：缺少引导文件 $f"; exit 1; }
+done
+
+emit_step 2 17 '卸载目标磁盘上的所有卷'
+/usr/sbin/diskutil unmountDisk force '/dev/disk4' || true
+
+emit_step 3 17 '裸盘写入权限预检与扇区对齐检查（0 字节写入 + 对齐读）'
+if [ "$(/usr/bin/id -u)" != "0" ]; then
+  echo "  ℹ 以普通用户运行：gpt create/add 要求 root，本脚本必须经管理员授权执行"
+fi
+# `gpt` 用缓冲节点，`dd` 用裸节点；TCC 可能只放行其中一个，两者都要验。
+for PROBE in '/dev/disk4' '/dev/rdisk4'; do
+  if [ ! -e "$PROBE" ]; then
+    echo "错误：找不到设备 $PROBE，请重新确认 U 盘设备名。"; exit 1
+  fi
+  if ! /bin/dd if=/dev/null of="$PROBE" bs=512 count=0 conv=notrunc 2>/dev/null; then
+    echo "=================================================================="
+    echo "拒绝执行：当前进程无法以写方式打开裸磁盘 $PROBE"
+    echo "原因：macOS 的「完全磁盘访问」(TCC / SIP) 会阻止非授权进程写入"
+    echo "      /dev/disk* 与 /dev/rdisk*，即使已获得 root 权限也一样。"
+    echo ""
+    echo "解决步骤（不需要终端）："
+    echo "  1) 系统设置 → 隐私与安全性 → 完全磁盘访问 → 添加并启用 VentoyMac.app"
+    echo "  2) 完全退出 VentoyMac 并重新打开（授权在进程启动时生效）"
+    echo "  3) 在应用「安装」页点「验证磁盘写入权限」，自动挑选可用提权通道"
+    echo "  4) 若仍失败，点「给系统提权进程授权」，把"
+    echo "     /usr/libexec/security_authtrampoline 也加入完全磁盘访问，再重启应用"
+    echo ""
+    echo "备用：导出本脚本，在已获完全磁盘访问的终端中执行 sudo bash <脚本>"
+    echo "=================================================================="
+    echo "预检未通过：未对磁盘做任何修改（仅执行过卸载，可重新插拔恢复）。"
+    exit 1
+  fi
+  if ! /bin/dd if="$PROBE" of=/dev/null bs=512 count=1 2>/dev/null; then
+    echo "拒绝执行：$PROBE 无法完成 512 字节扇区对齐读（设备不是 512n/512e，或仍被占用）"
+    echo "预检未通过：未对磁盘做任何修改（仅执行过卸载，可重新插拔恢复）。"
+    exit 1
+  fi
+  echo "  ✓ 可写且可对齐访问：$PROBE（0 字节写入 + 512 字节对齐读）"
+done
+echo "  ℹ 身份：有效 uid=$(/usr/bin/id -u)，真实 uid=$(/usr/bin/id -ru)（gpt 要求两者均为 0）"
+echo "  · 检查 gpt 写命令可用性（临时普通文件，不触碰磁盘）…"
+GPTCHECK="$VTOY_STAGE/gpt-capability.img"
+/bin/dd if=/dev/zero of="$GPTCHECK" bs=512 count=256 2>/dev/null
+if GPTERR="$(/usr/sbin/gpt create -f "$GPTCHECK" 2>&1)"; then
+  echo "  ✓ gpt create 可用（真实 uid 已为 0）"
+else
+  echo "  ⚠️ gpt create 在临时文件上失败：$GPTERR"
+  echo "     下一步 gpt create 是首个写盘命令；若同样失败，磁盘仍是零改动。"
+fi
+/bin/rm -f "$GPTCHECK"
+echo "权限与对齐预检通过：/dev/disk4 与 /dev/rdisk4 均未写入任何字节"
+
+emit_step 4 17 '清除旧分区表并重建 GPT（首个写入动作）'
+/usr/sbin/gpt destroy '/dev/disk4' 2>/dev/null || true
+if ! /usr/sbin/gpt create -f '/dev/disk4'; then
+  echo "错误：gpt create 失败。请核对上方身份行——gpt 要求真实 uid 为 0。"
+  echo "身份：$(/usr/bin/id)"
+  echo "未对磁盘写入任何字节（本步是第一条写入命令）。"
+  exit 1
+fi
+
+emit_step 5 17 '创建 GPT 分区表'
+/usr/sbin/gpt create -f '/dev/disk4'
+
+emit_step 6 17 '创建分区 1（Ventoy / exFAT 数据区）'
+/usr/sbin/gpt add -b 2048 -s 15661016 -i 1 -t EBD0A0A2-B9E5-4433-87C0-68B6B72699C7 '/dev/disk4'
+/usr/sbin/gpt label -i 1 -l 'Ventoy' '/dev/disk4'
+
+emit_step 7 17 '创建分区 2（VTOYEFI / 32 MiB EFI 系统分区）'
+/usr/sbin/gpt add -b 15663064 -s 65536 -i 2 -t C12A7328-F81F-11D2-BA4B-00A0C93EC93B '/dev/disk4'
+/usr/sbin/gpt label -i 2 -l 'VTOYEFI' '/dev/disk4'
+
+emit_step 8 17 '等待 macOS 生成分区设备节点'
+/usr/sbin/diskutil unmountDisk force '/dev/disk4' 2>/dev/null || true
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  [ -e '/dev/rdisk4s1' ] && break
+  # Nudge IOKit/DiskArbitration to re-probe the freshly written GPT.
+  /usr/sbin/diskutil list '/dev/disk4' >/dev/null 2>&1 || true
+  /bin/sleep 1
+done
+[ -e '/dev/rdisk4s1' ] || { echo "错误：分区 1 设备节点未出现，中止"; exit 1; }
+
+emit_step 9 17 '格式化分区 1 为 exFAT（卷标 Ventoy）'
+/sbin/newfs_exfat -v 'Ventoy' -c 64 '/dev/rdisk4s1'
+
+emit_step 10 17 '清空 VTOYEFI 分区引导扇区'
+/usr/sbin/diskutil unmountDisk force '/dev/disk4' 2>/dev/null || true
+sync
+/bin/dd if=/dev/zero of='/dev/rdisk4' bs=512 count=32 seek=15663064 conv=notrunc
+
+emit_step 11 17 '写入官方 VTOYEFI 分区镜像（GRUB2 + x86/IA32/ARM64 EFI）'
+/bin/dd if='/Users/daijh/Library/Application Support/VentoyMac/boot-1.1.18/ventoy.disk.img' of='/dev/rdisk4' bs=512 count=65536 seek=15663064 conv=notrunc
+
+emit_step 12 17 '写入 MBR 引导代码与 GPT 模式标记'
+/bin/dd if='/dev/disk4' of="$VTOY_STAGE/mbr.bin" bs=512 count=1
+# 确认读到的是 gpt create 生成的保护 MBR，否则宁可中止也不覆盖分区项
+PTYPE="$(/usr/bin/xxd -s 450 -l 1 -p "$VTOY_STAGE/mbr.bin")"
+[ "$PTYPE" = "ee" ] || { echo "错误：LBA 0 偏移 450 不是 0xEE 保护 MBR（实际 0x$PTYPE），中止以免破坏分区表"; exit 1; }
+[ "$(/usr/bin/xxd -s 510 -l 2 -p "$VTOY_STAGE/mbr.bin")" = "55aa" ] || { echo "错误：LBA 0 缺少 0x55AA 签名"; exit 1; }
+/bin/dd if='/Users/daijh/Library/Application Support/VentoyMac/boot-1.1.18/boot.img' of="$VTOY_STAGE/mbr.bin" bs=446 count=1 conv=notrunc
+# 0x22 → 八进制 \042；普通文件允许任意字节偏移，裸设备不允许
+printf '\042' | /bin/dd of="$VTOY_STAGE/mbr.bin" bs=1 count=1 seek=92 conv=notrunc
+/bin/dd if="$VTOY_STAGE/mbr.bin" of='/dev/disk4' bs=512 count=1 conv=notrunc
+
+emit_step 13 17 '写入 Legacy BIOS GRUB core（LBA 34–2047）'
+# 官方字节 17908 = LBA34×512 + 500，落在 core 镜像首个扇区
+/bin/dd if='/Users/daijh/Library/Application Support/VentoyMac/boot-1.1.18/core.img' of="$VTOY_STAGE/core.bin" bs=512 count=2014
+printf '\043' | /bin/dd of="$VTOY_STAGE/core.bin" bs=1 count=1 seek=500 conv=notrunc
+/bin/dd if="$VTOY_STAGE/core.bin" of='/dev/rdisk4' bs=512 count=2014 seek=34 conv=notrunc
+
+emit_step 14 17 '生成 Ventoy 磁盘 UUID 与 MBR 签名'
+UUIDFILE="$VTOY_STAGE/uuid.bin"
+/bin/dd if=/dev/urandom of="$UUIDFILE" bs=16 count=1 2>/dev/null
+# 重新读出 LBA 0，保留引导代码与保护 MBR；UUID / 签名补丁只落在暂存文件上
+/bin/dd if='/dev/disk4' of="$VTOY_STAGE/mbr.bin" bs=512 count=1
+/bin/dd if="$UUIDFILE" of="$VTOY_STAGE/mbr.bin" bs=1 count=16 seek=384 conv=notrunc
+/bin/dd if="$UUIDFILE" of="$VTOY_STAGE/mbr.bin" bs=1 count=4 skip=12 seek=440 conv=notrunc
+/bin/dd if="$VTOY_STAGE/mbr.bin" of='/dev/disk4' bs=512 count=1 conv=notrunc
+sync
+
+emit_step 15 17 '对齐读回校验 GPT 模式标记与 MBR 签名'
+/bin/dd if='/dev/disk4' of="$VTOY_STAGE/verify.bin" bs=512 count=1
+/bin/dd if='/dev/rdisk4' of="$VTOY_STAGE/verify-core.bin" bs=512 count=1 skip=34
+FLAG1="$(/usr/bin/xxd -s 92 -l 1 -p "$VTOY_STAGE/verify.bin")"
+FLAG2="$(/usr/bin/xxd -s 500 -l 1 -p "$VTOY_STAGE/verify-core.bin")"
+SIGNATURE="$(/usr/bin/xxd -s 510 -l 2 -p "$VTOY_STAGE/verify.bin")"
+[ "$FLAG1" = "22" ] || { echo "校验失败：字节 92 应为 0x22，实际为 0x$FLAG1"; exit 1; }
+[ "$FLAG2" = "23" ] || { echo "校验失败：字节 17908 应为 0x23，实际为 0x$FLAG2"; exit 1; }
+[ "$SIGNATURE" = "55aa" ] || { echo "校验失败：MBR 签名 0x55AA 缺失"; exit 1; }
+echo "  ✓ 字节 92=0x22、17908=0x23、MBR 签名 0x55AA"
+
+emit_step 16 17 '挂载 Ventoy 卷并准备 ISO 目录'
+/usr/sbin/diskutil unmountDisk force '/dev/disk4' 2>/dev/null || true
+/usr/sbin/diskutil mount '/dev/disk4s1' 2>/dev/null || true
+MP="$(ventoy_mount_point '/dev/disk4s1')"
+if [ -z "$MP" ]; then
+  MP="$(/usr/bin/mktemp -d -t ventoy-mount)"
+  /sbin/mount -t exfat '/dev/disk4s1' "$MP" || { echo "错误：无法挂载 Ventoy 数据分区，请手动挂载后复制 ISO"; exit 1; }
+fi
+/bin/mkdir -p "$MP/ISO"
+echo "挂载点：$MP"
+
+emit_step 17 17 '同步并输出完成信息'
+sync
+echo "Ventoy 1.1.18 已写入 /dev/disk4"
+/usr/sbin/gpt show -l '/dev/disk4'
+
+echo ''
+echo '完成。可安全推出 U 盘。'
+

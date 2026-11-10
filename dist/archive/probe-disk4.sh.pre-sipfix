@@ -1,0 +1,29 @@
+#!/bin/bash
+# VentoyMac 裸盘权限 + gpt 能力自检（对磁盘写入 0 字节）
+set -u
+for node in '/dev/disk4' '/dev/rdisk4'; do
+  if [ ! -e "$node" ]; then
+    echo "PROBE_MISSING: $node"
+    exit 1
+  fi
+  if ! /bin/dd if=/dev/null of="$node" bs=512 count=0 conv=notrunc 2>/dev/null; then
+    echo "PROBE_DENIED: $node"
+    exit 1
+  fi
+  if ! /bin/dd if="$node" of=/dev/null bs=512 count=1 2>/dev/null; then
+    echo "PROBE_UNALIGNED: $node"
+    exit 1
+  fi
+  echo "PROBE_OK: $node"
+done
+echo "PROBE_IDENTITY: euid=$(/usr/bin/id -u) ruid=$(/usr/bin/id -ru)"
+GPT_FILE="$(/usr/bin/mktemp -t vtoymac-gptprobe)"
+/bin/dd if=/dev/zero of="$GPT_FILE" bs=512 count=256 2>/dev/null
+if ! GPT_ERR="$(/usr/sbin/gpt create -f "$GPT_FILE" 2>&1)"; then
+  echo "PROBE_GPT_DENIED: $GPT_ERR"
+  /bin/rm -f "$GPT_FILE"
+  exit 1
+fi
+/bin/rm -f "$GPT_FILE"
+echo "PROBE_GPT_OK"
+echo "PROBE_RESULT: OK"

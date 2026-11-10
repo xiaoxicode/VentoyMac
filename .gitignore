@@ -1,0 +1,13 @@
+# SwiftPM 构建缓存（make build 可重新生成）
+.build/
+.swiftpm/
+
+# macOS 与 Xcode 噪声
+.DS_Store
+*.xcuserstate
+
+# 编译产物：应用包与内嵌签名 helper（本地保留，不入库）
+dist/VentoyMac.app/
+
+# Ventoy 官方离线发布包（19 MB，GPL，可从官方渠道下载或在应用内导入）
+dist/*.tar.gz
