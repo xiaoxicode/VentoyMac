@@ -11,7 +11,7 @@ import Foundation
 /// app detect that it is stale and ask to be restarted.
 public enum VentoyBuild {
     /// Bump on every .app rebuild that changes behaviour.
-    public static let id = "2026.11.10-b7"
+    public static let id = "2026.11.11-b9"
 
     /// Bump only when the generated Bash script changes.
     /// r3 = all raw-device writes are 512-byte sector aligned (fixes EINVAL).
@@ -28,7 +28,14 @@ public enum VentoyBuild {
     ///      to LBA 40; the leading gap restores the official LBA 2048. Step 5
     ///      now asserts partition 1's real offset so core.img cannot overlap
     ///      the data partition.
-    public static let scriptRevision = 6
+    /// r7 = Secure Boot support: verify shim / MokManager / enrollment
+    ///      certificate inside the freshly written VTOYEFI partition (read-only
+    ///      mount, so macOS metadata does not pollute the boot partition),
+    ///      pin the certificate SHA-256 computed before the write, and stage
+    ///      the enrollment material + Chinese instructions on the data
+    ///      partition (`SecureBoot/`), optionally writing
+    ///      `ventoy/ventoy.json` with VTOY_SECURE_BOOT_POLICY.
+    public static let scriptRevision = 7
 
     public static var banner: String {
         "VentoyMac 构建 \(id) · 安装脚本 r\(scriptRevision)"

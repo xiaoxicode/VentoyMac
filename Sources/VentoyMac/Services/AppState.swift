@@ -67,6 +67,14 @@ final class AppState: ObservableObject {
             ? .privileged : .helper
     }()
     @Published var diskAccess: DiskAccessStatus = .unknown
+    /// See `SecureBoot.swift` for why this cannot be a pure on/off switch: the
+    /// one-time MokManager enrollment is imposed by the target firmware, not by
+    /// the stick. The toggle controls whether the stick carries the verified
+    /// shim chain plus ready-to-enroll material.
+    @Published var secureBootEnabled: Bool = UserDefaults.standard.bool(forKey: "VentoyMacSecureBootEnabled")
+    @Published var secureBootPolicy: SecureBootPolicy = SecureBootPolicy(
+        rawValue: UserDefaults.standard.string(forKey: "VentoyMacSecureBootPolicy") ?? "") ?? .bypass
+    @Published var secureBootInspection: SecureBootInspection?
     /// True when the .app on disk was rebuilt while this process was already
     /// running. The window then still executes the OLD install script.
     @Published var isStaleBuild = false
@@ -110,6 +118,62 @@ final class AppState: ObservableObject {
             appendLog("⚠️ 未找到应用内的签名 helper，将以兼容模式运行；请用 dist/VentoyMac.app 启动。")
         }
         refreshDevices()
+        refreshSecureBootInspection()
+    }
+
+    // MARK: Secure Boot
+
+    func setSecureBootEnabled(_ enabled: Bool) {
+        guard secureBootEnabled != enabled else { return }
+        secureBootEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "VentoyMacSecureBootEnabled")
+        appendLog("")
+        if enabled {
+            appendLog("── 已启用 UEFI Secure Boot 支持 ──")
+            appendLog("安装脚本将① 只读挂载 VTOYEFI 校验 shim / MokManager / 证书；② 把证书与中文说明写到数据分区 SecureBoot/。")
+            appendLog("注意：首次在新机器上启动仍需在蓝色 MokManager 界面注册一次该证书——信任根在固件里，U 盘无法代替。")
+            appendLog("      想彻底免按键：把这枚证书一次性写入该机固件 db（BIOS → Secure Boot → 密钥管理）。")
+        } else {
+            appendLog("已关闭 Secure Boot 支持选项：脚本不再校验注册材料（U 盘仍含完整 shim 链，固件开启 Secure Boot 时会提示注册）。")
+        }
+        if enabled && secureBootInspection == nil { refreshSecureBootInspection() }
+        regeneratePreview()
+    }
+
+    func setSecureBootPolicy(_ policy: SecureBootPolicy) {
+        guard secureBootPolicy != policy else { return }
+        secureBootPolicy = policy
+        UserDefaults.standard.set(policy.rawValue, forKey: "VentoyMacSecureBootPolicy")
+        appendLog("Secure Boot 策略：\(policy.title)")
+        regeneratePreview()
+    }
+
+    /// Parses the cached 32 MiB VTOYEFI image off the main thread. Purely
+    /// in-memory: no disk image is attached, so the device list stays clean.
+    func refreshSecureBootInspection() {
+        guard let assets else {
+            secureBootInspection = nil
+            return
+        }
+        let path = assets.efiImage
+        let version = assets.version
+        Task.detached(priority: .utility) {
+            let result: SecureBootInspection
+            do {
+                result = try SecureBootInspector.inspect(efiImage: URL(fileURLWithPath: path))
+            } catch {
+                result = SecureBootInspection(status: .unavailable(error.localizedDescription))
+            }
+            await MainActor.run {
+                guard self.assets?.version == version else { return }
+                self.secureBootInspection = result
+                self.appendLog("Secure Boot 组件检查：\(result.summary)")
+                if let fingerprint = result.certificateSHA256 {
+                    self.appendLog("  证书 SHA-256：\(fingerprint)")
+                }
+                for item in result.found { self.appendLog("  · \(item)") }
+            }
+        }
     }
 
     // MARK: Disk access (no Terminal required)
@@ -253,6 +317,7 @@ final class AppState: ObservableObject {
         runBusy("正在获取官方引导资源") {
             let result = try await self.assetManager.downloadLatest()
             self.infoMessage = "引导资源已就绪：Ventoy \(result.version)"
+            self.refreshSecureBootInspection()
             self.regeneratePreview()
         }
     }
@@ -266,6 +331,7 @@ final class AppState: ObservableObject {
         runBusy("正在导入本地发布包") {
             let result = try await self.assetManager.importPackage(url)
             self.infoMessage = "已从本地包导入 Ventoy \(result.version)"
+            self.refreshSecureBootInspection()
             self.regeneratePreview()
         }
     }
@@ -291,7 +357,10 @@ final class AppState: ObservableObject {
                            assets: assets,
                            volumeLabel: volumeLabel,
                            isoPaths: isoPaths,
-                           mode: mode)
+                           mode: mode,
+                           secureBoot: SecureBootOptions(enabled: secureBootEnabled,
+                                                         policy: secureBootPolicy),
+                           secureBootInspection: secureBootInspection)
     }
 
     func regeneratePreview() {

@@ -432,3 +432,362 @@ final class DiskAccessProbeTests: XCTestCase {
         XCTAssertFalse(script.contains("/dev/disk"), "设置脚本不得触碰磁盘")
     }
 }
+
+// MARK: - FAT16 / Secure Boot
+
+/// Hand-built FAT16 image (512 B/sector, 1 sector/cluster, 512 root entries)
+/// shaped like the official VTOYEFI partition:
+///
+///   /EFI/BOOT/BOOTX64.EFI    8.3 name
+///   /EFI/BOOT/mmx64.efi      8.3 name
+///   /EFI/BOOT/grubx64.efi    8.3 name
+///   /ENROLL_THIS_KEY_IN_MOKMANAGER.cer   long name (LFN) + 8.3 alias
+///
+/// Clusters: 2 = \EFI, 3 = \EFI\BOOT, 4/5 = loader files, 6-8 = certificate.
+struct FAT16Fixture {
+    static let sector = 512
+    static let reserved = 1
+    static let fatSize = 32
+    static let rootEntries = 512
+    static let totalSectors = 8_192
+
+    static var dataOffset: Int { (reserved + fatSize + rootEntries * 32 / sector) * sector }
+
+    var certificate = Data(repeating: 0xA5, count: 1_420)
+    var includeMokManager = true
+    var includeShim = true
+    var includeCertificate = true
+
+    func render() -> Data {
+        var image = Data(count: Self.totalSectors * Self.sector)
+
+        // ---- boot sector -------------------------------------------------
+        image[0] = 0xEB; image[1] = 0x3C; image[2] = 0x90
+        put(Array("MSDOS5.0".utf8), at: 3, in: &image)
+        put16(UInt16(Self.sector), at: 11, in: &image)
+        image[13] = 1                                     // sectors per cluster
+        put16(UInt16(Self.reserved), at: 14, in: &image)
+        image[16] = 1                                     // number of FATs
+        put16(UInt16(Self.rootEntries), at: 17, in: &image)
+        put16(0, at: 19, in: &image)                      // total sectors 16
+        image[21] = 0xF8
+        put16(UInt16(Self.fatSize), at: 22, in: &image)
+        put32(UInt32(Self.totalSectors), at: 32, in: &image)
+        image[38] = 0x29
+        put(Array("VTOYEFI    ".utf8), at: 43, in: &image)
+        put(Array("FAT16   ".utf8), at: 54, in: &image)
+        image[510] = 0x55; image[511] = 0xAA
+
+        // ---- FAT ---------------------------------------------------------
+        let fatOffset = Self.reserved * Self.sector
+        func setFat(_ cluster: Int, _ value: UInt16) {
+            put16(value, at: fatOffset + cluster * 2, in: &image)
+        }
+        setFat(0, 0xFFF8)
+        setFat(1, 0xFFFF)
+        setFat(2, 0xFFFF)          // \EFI, one cluster
+        setFat(3, 0xFFFF)          // \EFI\BOOT, one cluster
+        setFat(4, 0xFFFF)          // BOOTX64.EFI
+        setFat(5, 0xFFFF)          // mmx64.efi
+        setFat(6, 0xFFFF)          // grubx64.efi
+        setFat(7, 8)               // certificate: 7 -> 8 -> 9
+        setFat(8, 9)
+        setFat(9, 0xFFFF)
+
+        // ---- directories -------------------------------------------------
+        var root = Data()
+        root.append(Self.entry(short: "EFI     ", ext: "   ", attr: 0x10, cluster: 2, size: 0))
+        if includeCertificate {
+            for fragment in Self.longNameEntries("ENROLL_THIS_KEY_IN_MOKMANAGER.cer",
+                                                 short: "ENROLL~1CER") {
+                root.append(fragment)
+            }
+            root.append(Self.entry(short: "ENROLL~1", ext: "CER", attr: 0x20, cluster: 7,
+                                   size: UInt32(certificate.count)))
+        }
+        let rootOffset = (Self.reserved + Self.fatSize) * Self.sector
+        put(Array(root), at: rootOffset, in: &image)
+
+        var efi = Data()
+        efi.append(Self.entry(short: ".       ", ext: "   ", attr: 0x10, cluster: 2, size: 0))
+        efi.append(Self.entry(short: "..      ", ext: "   ", attr: 0x10, cluster: 0, size: 0))
+        efi.append(Self.entry(short: "BOOT    ", ext: "   ", attr: 0x10, cluster: 3, size: 0))
+        put(Array(efi), at: clusterOffset(2), in: &image)
+
+        var boot = Data()
+        boot.append(Self.entry(short: ".       ", ext: "   ", attr: 0x10, cluster: 2, size: 0))
+        boot.append(Self.entry(short: "..      ", ext: "   ", attr: 0x10, cluster: 2, size: 0))
+        if includeShim {
+            boot.append(Self.entry(short: "BOOTX64 ", ext: "EFI", attr: 0x20, cluster: 4, size: 4))
+        }
+        if includeMokManager {
+            boot.append(Self.entry(short: "MMX64   ", ext: "EFI", attr: 0x20, cluster: 5, size: 4))
+        }
+        boot.append(Self.entry(short: "GRUBX64 ", ext: "EFI", attr: 0x20, cluster: 6, size: 4))
+        put(Array(boot), at: clusterOffset(3), in: &image)
+
+        // ---- file contents ----------------------------------------------
+        put(Array("SHIM".utf8), at: clusterOffset(4), in: &image)
+        put(Array("MOKM".utf8), at: clusterOffset(5), in: &image)
+        put(Array("GRUB".utf8), at: clusterOffset(6), in: &image)
+        if includeCertificate {
+            for (index, cluster) in [7, 8, 9].enumerated() {
+                let start = index * Self.sector
+                let end = min(start + Self.sector, certificate.count)
+                guard start < end else { break }
+                put(Array(certificate[start..<end]), at: clusterOffset(cluster), in: &image)
+            }
+        }
+        return image
+    }
+
+    private func clusterOffset(_ cluster: Int) -> Int {
+        Self.dataOffset + (cluster - 2) * Self.sector
+    }
+
+    private func put(_ bytes: [UInt8], at offset: Int, in image: inout Data) {
+        guard offset + bytes.count <= image.count else { return }
+        image.replaceSubrange(offset..<(offset + bytes.count), with: bytes)
+    }
+
+    private func put16(_ value: UInt16, at offset: Int, in image: inout Data) {
+        put([UInt8(value & 0xFF), UInt8(value >> 8)], at: offset, in: &image)
+    }
+
+    private func put32(_ value: UInt32, at offset: Int, in image: inout Data) {
+        put([UInt8(value & 0xFF), UInt8((value >> 8) & 0xFF),
+             UInt8((value >> 16) & 0xFF), UInt8(value >> 24)], at: offset, in: &image)
+    }
+
+    static func entry(short: String, ext: String, attr: UInt8, cluster: UInt32, size: UInt32) -> Data {
+        var bytes = [UInt8](repeating: 0x20, count: 32)
+        let nameBytes = Array((short + ext).utf8)
+        for (index, byte) in nameBytes.enumerated() where index < 11 { bytes[index] = byte }
+        bytes[11] = attr
+        bytes[20] = UInt8((cluster >> 16) & 0xFF)
+        bytes[21] = UInt8((cluster >> 24) & 0xFF)
+        bytes[26] = UInt8(cluster & 0xFF)
+        bytes[27] = UInt8((cluster >> 8) & 0xFF)
+        bytes[28] = UInt8(size & 0xFF)
+        bytes[29] = UInt8((size >> 8) & 0xFF)
+        bytes[30] = UInt8((size >> 16) & 0xFF)
+        bytes[31] = UInt8(size >> 24)
+        return Data(bytes)
+    }
+
+    /// Long-file-name fragments, written back-to-front as Windows does.
+    static func longNameEntries(_ name: String, short: String) -> [Data] {
+        let units = Array(name.utf16)
+        let count = (units.count + 12) / 13
+        let checksum = shortNameChecksum(short)
+        var entries: [Data] = []
+        for sequence in stride(from: count, through: 1, by: -1) {
+            var bytes = [UInt8](repeating: 0xFF, count: 32)
+            bytes[0] = UInt8(sequence) | (sequence == count ? 0x40 : 0)
+            bytes[11] = 0x0F
+            bytes[12] = 0
+            bytes[13] = checksum
+            bytes[26] = 0
+            bytes[27] = 0
+            let start = (sequence - 1) * 13
+            let slots = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30]
+            for offset in 0..<13 {
+                let index = start + offset
+                let value: UInt16 = index < units.count ? units[index]
+                    : (index == units.count ? 0x0000 : 0xFFFF)
+                bytes[slots[offset]] = UInt8(value & 0xFF)
+                bytes[slots[offset] + 1] = UInt8(value >> 8)
+            }
+            entries.append(Data(bytes))
+        }
+        return entries
+    }
+
+    static func shortNameChecksum(_ short: String) -> UInt8 {
+        var sum: UInt8 = 0
+        for byte in Array(short.utf8) {
+            sum = ((sum & 1) << 7) &+ (sum >> 1) &+ byte
+        }
+        return sum
+    }
+}
+
+final class FAT16VolumeTests: XCTestCase {
+
+    func testParsesNestedDirectoriesAndLongNames() throws {
+        let volume = try FAT16Volume(data: FAT16Fixture().render())
+        XCTAssertEqual(volume.bytesPerSector, 512)
+        XCTAssertEqual(volume.sectorsPerCluster, 1)
+        XCTAssertGreaterThanOrEqual(volume.clusterCount, 4_085)
+
+        let shim = try XCTUnwrap(try volume.entry(at: "EFI/BOOT/BOOTX64.EFI"))
+        XCTAssertEqual(shim.size, 4)
+        XCTAssertEqual(try volume.data(of: shim), Data("SHIM".utf8))
+
+        // Path lookup is case-insensitive, like the firmware's FAT driver.
+        XCTAssertNotNil(try volume.entry(at: "efi/boot/mmx64.efi"))
+
+        // Long name from LFN fragments; the 8.3 alias is ENROLL~1.CER.
+        let cert = try XCTUnwrap(try volume.entry(at: "ENROLL_THIS_KEY_IN_MOKMANAGER.cer"))
+        XCTAssertEqual(cert.size, 1_420)
+        XCTAssertEqual(try volume.data(of: cert), FAT16Fixture().certificate)
+    }
+
+    func testMissingPathReturnsNil() throws {
+        let volume = try FAT16Volume(data: FAT16Fixture().render())
+        XCTAssertNil(try volume.entry(at: "EFI/BOOT/nope.efi"))
+        XCTAssertFalse(try volume.exists("EFI/NOPE"))
+    }
+
+    func testRejectsNonFAT16Images() {
+        XCTAssertThrowsError(try FAT16Volume(data: Data(count: 512)))
+        XCTAssertThrowsError(try FAT16Volume(data: Data(count: 64))) { error in
+            XCTAssertEqual(error as? FAT16Volume.ParseError, .truncated)
+        }
+    }
+}
+
+final class SecureBootInspectorTests: XCTestCase {
+
+    func testCompleteImageReportsEveryComponent() throws {
+        let fixture = FAT16Fixture()
+        let inspection = SecureBootInspector.inspect(imageData: fixture.render())
+        XCTAssertEqual(inspection.status, .complete, inspection.summary)
+        XCTAssertTrue(inspection.missing.isEmpty)
+        XCTAssertEqual(inspection.certificateSize, 1_420)
+
+        let expected = try BootAssetInstaller.sha256(
+            URL(fileURLWithPath: writeTemporary(fixture.certificate)))
+        XCTAssertEqual(inspection.certificateSHA256, expected, "证书指纹必须与文件字节的 SHA-256 一致")
+        XCTAssertTrue(inspection.isPinnable)
+    }
+
+    func testMissingMokManagerIsIncomplete() {
+        var fixture = FAT16Fixture()
+        fixture.includeMokManager = false
+        let inspection = SecureBootInspector.inspect(imageData: fixture.render())
+        XCTAssertEqual(inspection.status, .incomplete)
+        XCTAssertTrue(inspection.missing.contains { $0.contains("mmx64.efi") },
+                      "缺少 MokManager 必须被识别（否则 0x1a 会变成死路）：\(inspection.missing)")
+    }
+
+    func testMissingCertificateIsIncomplete() {
+        var fixture = FAT16Fixture()
+        fixture.includeCertificate = false
+        let inspection = SecureBootInspector.inspect(imageData: fixture.render())
+        XCTAssertEqual(inspection.status, .incomplete)
+        XCTAssertNil(inspection.certificateSHA256)
+        XCTAssertFalse(inspection.isPinnable)
+    }
+
+    func testUnparseableImageIsUnavailableNotFatal() {
+        // The CLI/GUI fixtures use a zero-filled 32 MiB placeholder: the
+        // inspector must report `unavailable`, never a false "complete".
+        let inspection = SecureBootInspector.inspect(imageData: Data(count: 33_554_432))
+        guard case .unavailable = inspection.status else {
+            return XCTFail("应报告 unavailable，实际 \(inspection.status)")
+        }
+        XCTAssertFalse(inspection.isComplete)
+    }
+
+    private func writeTemporary(_ data: Data) -> String {
+        let path = NSTemporaryDirectory() + "vtoy-cert-\(UUID().uuidString).cer"
+        FileManager.default.createFile(atPath: path, contents: data)
+        return path
+    }
+}
+
+final class SecureBootScriptTests: XCTestCase {
+
+    private func makePlan(secureBoot: SecureBootOptions,
+                          inspection: SecureBootInspection? = nil,
+                          mode: ScriptMode = .audit) throws -> InstallPlan {
+        let device = DiskDevice(
+            bsdName: "disk9", deviceNode: "/dev/disk9", mediaName: "Test USB",
+            busProtocol: "USB", totalBytes: 32 * 1_024 * 1_024 * 1_024,
+            isWholeDisk: true, isInternal: false, isRemovable: true, isEjectable: true,
+            isVirtual: false, content: "GUID_partition_scheme", volumeNames: [],
+            deviceBlockSize: 512)
+        let dir = NSTemporaryDirectory() + "vtoymac-sb-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        for (name, size) in [("boot.img", 512),
+                             ("core.img", Int(VentoySpec.coreImagePackagedBytes)),
+                             ("ventoy.disk.img", Int(VentoySpec.efiBytes))] {
+            FileManager.default.createFile(atPath: dir + "/" + name, contents: Data(count: size))
+        }
+        let assets = BootAssets(version: "1.1.18", directory: dir)
+        let layout = try VentoyLayoutCalculator.gpt(totalBytes: device.totalBytes)
+        return InstallPlan(device: device, layout: layout, assets: assets, mode: mode,
+                           secureBoot: secureBoot, secureBootInspection: inspection)
+    }
+
+    func testDisabledProducesNoSecureBootWork() throws {
+        let script = try InstallScriptBuilder.build(makePlan(secureBoot: SecureBootOptions()))
+        XCTAssertFalse(script.text.contains("vty_sb_has"))
+        XCTAssertFalse(script.text.contains("SecureBoot/"))
+        XCTAssertFalse(script.steps.contains { $0.title.contains("Secure Boot") })
+        XCTAssertTrue(script.text.contains("SecureBoot: disabled"))
+    }
+
+    func testEnabledVerifiesChainReadOnlyAndStagesMaterial() throws {
+        let inspection = SecureBootInspector.inspect(imageData: FAT16Fixture().render())
+        let script = try InstallScriptBuilder.build(
+            makePlan(secureBoot: SecureBootOptions(enabled: true, policy: .strict),
+                     inspection: inspection))
+
+        // Authoritative post-write check, mounted read-only so macOS does not
+        // litter the boot partition with ._* / .fseventsd files.
+        XCTAssertTrue(script.text.contains("diskutil mount readOnly nobrowse"))
+        XCTAssertTrue(script.text.contains("vty_sb_has"))
+        XCTAssertTrue(script.text.contains("MokManager"))
+
+        // Fingerprint computed before the write is pinned into the script.
+        let sha = try XCTUnwrap(inspection.certificateSHA256)
+        XCTAssertTrue(script.text.contains(sha), "脚本必须固定写入前算出的证书指纹")
+
+        // Enrollment material lands on the data partition, twice.
+        XCTAssertTrue(script.text.contains("\"$MP/\(SecureBootSpec.dataDirectory)/\(SecureBootSpec.certificateName)\""))
+        XCTAssertTrue(script.text.contains("\"$MP/\(SecureBootSpec.certificateName)\""))
+        XCTAssertTrue(script.text.contains(SecureBootSpec.readmeName))
+        XCTAssertTrue(script.text.contains("Enroll key from disk"))
+
+        // Strict policy → global control plugin.
+        XCTAssertTrue(script.text.contains("\"VTOY_SECURE_BOOT_POLICY\": \"1\""))
+
+        // Step order: verify after writing VTOYEFI, before formatting part 1.
+        let verify = try XCTUnwrap(script.steps.firstIndex { $0.title.contains("Secure Boot 组件") })
+        let write = try XCTUnwrap(script.steps.firstIndex { $0.title.contains("写入官方 VTOYEFI") })
+        let format = try XCTUnwrap(script.steps.firstIndex { $0.title.contains("exFAT") })
+        XCTAssertLessThan(write, verify)
+        XCTAssertLessThan(verify, format)
+        XCTAssertFalse(script.steps[verify].isDestructive, "只读挂载的校验步骤不应标记为写入")
+    }
+
+    func testBypassPolicyDoesNotWritePlugin() throws {
+        let script = try InstallScriptBuilder.build(
+            makePlan(secureBoot: SecureBootOptions(enabled: true, policy: .bypass)))
+        XCTAssertFalse(script.text.contains("\"VTOY_SECURE_BOOT_POLICY\": \"1\""))
+        XCTAssertTrue(script.text.contains("完全绕过验证"))
+    }
+
+    func testPlanRejectsKnownIncompleteChain() {
+        var fixture = FAT16Fixture()
+        fixture.includeMokManager = false
+        let inspection = SecureBootInspector.inspect(imageData: fixture.render())
+        XCTAssertThrowsError(try InstallScriptBuilder.build(
+            makePlan(secureBoot: SecureBootOptions(enabled: true), inspection: inspection))) { error in
+            guard case InstallPlanError.secureBootIncomplete = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testPlanToleratesUnknownImageWhenSecureBootDisabled() throws {
+        // Zero-filled placeholder → inspector reports `unavailable`; that must
+        // not block a normal (Secure Boot disabled) install.
+        let inspection = SecureBootInspector.inspect(imageData: Data(count: 33_554_432))
+        let script = try InstallScriptBuilder.build(
+            makePlan(secureBoot: SecureBootOptions(), inspection: inspection))
+        XCTAssertFalse(script.text.contains("vty_sb_has"))
+    }
+}

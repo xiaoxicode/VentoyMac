@@ -5,8 +5,9 @@
 # Version: Ventoy self-test
 # Mode   : AUDIT (no writes)
 # Layout : GPT / part1 LBA 2048 + 67041240, part2 LBA 67043288 + 65536
-# Build  : 2026.11.10-b7  (install script r6)
+# Build  : 2026.11.11-b9  (install script r7)
 # Source : https://github.com/ventoy/Ventoy  (INSTALL/tool/ventoy_lib.sh)
+# SecureBoot: disabled（U 盘仍含完整 shim 链，固件开启 Secure Boot 时会提示注册）
 # =====================================================================
 # 警告：本脚本会彻底清空目标磁盘上的所有数据，请在执行前逐条审阅。
 
@@ -39,12 +40,12 @@ vtoy_raw_write() {
 VTOY_STAGE="$(/usr/bin/mktemp -d -t vtoymac-stage)"
 cleanup_stage() {
   /bin/rm -f "$VTOY_STAGE/mbr.bin" "$VTOY_STAGE/core.bin" "$VTOY_STAGE/uuid.bin" \
-           "$VTOY_STAGE/verify.bin" "$VTOY_STAGE/verify-core.bin"
+           "$VTOY_STAGE/verify.bin" "$VTOY_STAGE/verify-core.bin" "$VTOY_STAGE/enroll.cer"
   /bin/rmdir "$VTOY_STAGE" 2>/dev/null || true
 }
 trap cleanup_stage EXIT
 
-echo 'VentoyMac 构建 2026.11.10-b7 · 安装脚本 r6 · 目标 /dev/disk9'
+echo 'VentoyMac 构建 2026.11.11-b9 · 安装脚本 r7 · 目标 /dev/disk9'
 
 emit_step 1 14 '校验目标磁盘与引导资源'
 printf '    $ %s\n' 'INFO="$(/usr/sbin/diskutil info -plist '\''/dev/disk9'\'')" || { echo "错误：无法读取 disk9 信息"; exit 1; }

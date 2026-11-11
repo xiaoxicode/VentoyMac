@@ -8,6 +8,47 @@ import VentoyCore
 let arguments = Array(CommandLine.arguments.dropFirst())
 let command = arguments.first ?? "help"
 
+/// Positional arguments with `--flags` removed, so `script disk9 --secure-boot`
+/// and `script --secure-boot disk9` behave the same.
+let positional = arguments.filter { !$0.hasPrefix("--") }
+let options = arguments.filter { $0.hasPrefix("--") }
+
+/// Parsed Secure Boot switch. Defaults to off, mirroring the GUI default and
+/// the fact that the one-time MokManager enrollment is a firmware-side action
+/// the stick cannot perform. `--secure-boot-policy=strict` additionally writes
+/// `ventoy/ventoy.json` with VTOY_SECURE_BOOT_POLICY=1.
+func secureBootOptions() -> SecureBootOptions {
+    var result = SecureBootOptions()
+    for option in options {
+        switch option {
+        case "--secure-boot", "--secure-boot=yes", "-s":
+            result.enabled = true
+        case "--no-secure-boot", "--secure-boot=no":
+            result.enabled = false
+        case "--secure-boot-policy=strict":
+            result.enabled = true
+            result.policy = .strict
+        case "--secure-boot-policy=bypass":
+            result.enabled = true
+            result.policy = .bypass
+        default:
+            break
+        }
+    }
+    return result
+}
+
+/// Host-side inspection of the cached VTOYEFI image (pure in-memory FAT16
+/// parse, nothing is mounted). nil when no assets are installed.
+func secureBootInspection(for assets: BootAssets?) -> SecureBootInspection? {
+    guard let assets else { return nil }
+    do {
+        return try SecureBootInspector.inspect(efiImage: URL(fileURLWithPath: assets.efiImage))
+    } catch {
+        return SecureBootInspection(status: .unavailable(error.localizedDescription))
+    }
+}
+
 func capture(_ path: String, _ args: [String]) throws -> Data {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: path)
@@ -193,6 +234,41 @@ case "self-test":
         check(!script.text.contains("需要 root 权限"), "安装脚本不强制 root（身份由提权通道决定）")
         check(script.text.contains("security_authtrampoline"), "预检指引包含系统提权进程授权步骤")
         check(script.text.contains("添加并启用 VentoyMac.app"), "预检指引以给 VentoyMac.app 授权为主")
+
+        // ---- Secure Boot -------------------------------------------------
+        check(!script.text.contains("vty_sb_has"), "未勾选 Secure Boot 时不生成注册材料步骤")
+        let sbPlan = InstallPlan(device: sampleDevice(), layout: layout, assets: assets, mode: .audit,
+                                 secureBoot: SecureBootOptions(enabled: true, policy: .strict))
+        let sbScript = try InstallScriptBuilder.build(sbPlan)
+        check(sbScript.text.contains("vty_sb_has"), "勾选后脚本包含 VTOYEFI 组件校验函数")
+        check(sbScript.text.contains("diskutil mount readOnly"),
+              "组件校验以只读方式挂载 VTOYEFI（避免 macOS 元数据污染）")
+        check(sbScript.text.contains("MokManager"), "缺少 MokManager 时给出明确中止说明")
+        check(sbScript.text.contains("Enroll key from disk"), "脚本内置中文注册说明")
+        check(sbScript.text.contains(VentoySpec.efiVolumeLabel) || sbScript.text.contains("VTOYEFI"),
+              "说明文字指向 VTOYEFI 分区")
+        check(sbScript.text.contains("VTOY_SECURE_BOOT_POLICY"), "严格策略写入 ventoy/ventoy.json")
+        check(sbScript.text.contains("SECURE-BOOT-README.txt"), "数据分区写入中文说明文件")
+        check(sbScript.steps.contains { $0.title.contains("Secure Boot 组件") },
+              "勾选后存在 Secure Boot 组件校验步骤")
+        if let verify = sbScript.steps.firstIndex(where: { $0.title.contains("Secure Boot 组件") }),
+           let format = sbScript.steps.firstIndex(where: { $0.title.contains("exFAT") }) {
+            check(verify < format, "组件校验发生在格式化数据分区之前")
+        } else {
+            check(false, "缺少组件校验或格式化步骤")
+        }
+        let bypassScript = try InstallScriptBuilder.build(
+            InstallPlan(device: sampleDevice(), layout: layout, assets: assets, mode: .audit,
+                        secureBoot: SecureBootOptions(enabled: true, policy: .bypass)))
+        check(!bypassScript.text.contains("\"VTOY_SECURE_BOOT_POLICY\": \"1\""),
+              "默认策略不写严格插件")
+        if let cached = BootAssetInstaller.loadCached() {
+            let inspection = try SecureBootInspector.inspect(efiImage: URL(fileURLWithPath: cached.efiImage))
+            check(inspection.isComplete, "真实 VTOYEFI 镜像通过组件检查（\(inspection.summary)）")
+            check(inspection.certificateSHA256?.count == 64, "证书 SHA-256 为 64 位十六进制")
+        } else {
+            print("  – 未安装真实引导资源，跳过镜像内组件检查")
+        }
     } catch {
         print("  ✗ 自检异常：\(error)")
         failures += 1
@@ -231,11 +307,11 @@ case "plan":
     for line in layout.summaryLines { print(line) }
 
 case "script":
-    guard arguments.count >= 2 else {
-        print("用法: ventoymac-cli script <diskN>  （输出审计模式脚本）")
+    guard positional.count >= 2 else {
+        print("用法: ventoymac-cli script <diskN> [--secure-boot[=strict|bypass]|--no-secure-boot]")
         exit(2)
     }
-    let name = arguments[1]
+    let name = positional[1]
     guard let device = try externalDevices().first(where: { $0.bsdName == name }) else {
         print("未找到外接整盘 \(name)")
         exit(1)
@@ -247,7 +323,9 @@ case "script":
     let sectorSize = device.deviceBlockSize > 0 ? device.deviceBlockSize : 512
     let layout = try VentoyLayoutCalculator.gpt(totalBytes: device.totalBytes,
                                                 deviceSectorSize: sectorSize)
-    let plan = InstallPlan(device: device, layout: layout, assets: assets, mode: .audit)
+    let plan = InstallPlan(device: device, layout: layout, assets: assets, mode: .audit,
+                           secureBoot: secureBootOptions(),
+                           secureBootInspection: secureBootInspection(for: assets))
     print(try InstallScriptBuilder.build(plan).text)
 
 case "probe-script":
@@ -277,11 +355,11 @@ case "live-script":
     // execute it from a Terminal.app that has Full Disk Access:
     //   ventoymac-cli live-script disk4 > ~/Downloads/install.sh
     //   sudo bash ~/Downloads/install.sh
-    guard arguments.count >= 2 else {
-        print("用法: ventoymac-cli live-script <diskN>  （输出可执行脚本，但不执行）")
+    guard positional.count >= 2 else {
+        print("用法: ventoymac-cli live-script <diskN> [--secure-boot[=strict|bypass]]")
         exit(2)
     }
-    let name = arguments[1]
+    let name = positional[1]
     guard let device = try externalDevices().first(where: { $0.bsdName == name }) else {
         print("未找到外接整盘 \(name)")
         exit(1)
@@ -293,7 +371,9 @@ case "live-script":
     let sectorSize = device.deviceBlockSize > 0 ? device.deviceBlockSize : 512
     let layout = try VentoyLayoutCalculator.gpt(totalBytes: device.totalBytes,
                                                 deviceSectorSize: sectorSize)
-    let plan = InstallPlan(device: device, layout: layout, assets: assets, mode: .live)
+    let plan = InstallPlan(device: device, layout: layout, assets: assets, mode: .live,
+                           secureBoot: secureBootOptions(),
+                           secureBootInspection: secureBootInspection(for: assets))
     let script = try InstallScriptBuilder.build(plan)
     // Keep stdout a clean, executable script; guidance goes to stderr.
     FileHandle.standardError.write(Data("""
@@ -308,11 +388,11 @@ case "rehearse-script":
     // Generates a LIVE script for a synthetic disk of the given size, so the
     // complete write chain can be rehearsed on a `hdiutil attach -nomount`
     // disk image (owned by the current user) without root or a real USB disk.
-    guard arguments.count >= 3, let bytes = UInt64(arguments[2]) else {
-        print("用法: ventoymac-cli rehearse-script <diskN> <totalBytes>  （只打印，不执行）")
+    guard positional.count >= 3, let bytes = UInt64(positional[2]) else {
+        print("用法: ventoymac-cli rehearse-script <diskN> <totalBytes> [--secure-boot]  （只打印，不执行）")
         exit(2)
     }
-    let name = arguments[1]
+    let name = positional[1]
     guard let assets = cachedAssets() else {
         print("尚未安装引导资源。请先在 VentoyMac 应用中下载或导入官方 tar.gz。")
         exit(1)
@@ -331,7 +411,9 @@ case "rehearse-script":
                             content: "",
                             volumeNames: [],
                             deviceBlockSize: 512)
-    let plan = InstallPlan(device: device, layout: layout, assets: assets, mode: .live)
+    let plan = InstallPlan(device: device, layout: layout, assets: assets, mode: .live,
+                           secureBoot: secureBootOptions(),
+                           secureBootInspection: secureBootInspection(for: assets))
     var text = try InstallScriptBuilder.build(plan).text
     // A disk image is owned by the current user, so the root identity gate is
     // the only line that must be relaxed for a local rehearsal. The production
@@ -351,8 +433,48 @@ case "demo-script":
     // generated Bash can be linted and executed without any real hardware.
     let layout = try VentoyLayoutCalculator.gpt(totalBytes: 32 * 1_024 * 1_024 * 1_024)
     let assets = try fakeAssets()
-    let plan = InstallPlan(device: sampleDevice(), layout: layout, assets: assets, mode: .audit)
+    let plan = InstallPlan(device: sampleDevice(), layout: layout, assets: assets, mode: .audit,
+                           secureBoot: secureBootOptions(),
+                           secureBootInspection: secureBootInspection(for: assets))
     print(try InstallScriptBuilder.build(plan).text)
+
+case "secure-boot-check":
+    // Pure in-memory FAT16 parse of ventoy.disk.img: verifies that the shim,
+    // MokManager and the enrollment certificate are actually inside the image
+    // that is about to be written. Nothing is mounted, nothing is written.
+    let candidatePath: String?
+    if positional.count >= 2 {
+        candidatePath = positional[1]
+    } else {
+        candidatePath = cachedAssets()?.efiImage
+    }
+    guard let path = candidatePath else {
+        print("尚未安装引导资源。请指定镜像路径：ventoymac-cli secure-boot-check <ventoy.disk.img>")
+        exit(1)
+    }
+    guard FileManager.default.fileExists(atPath: path) else {
+        print("文件不存在：\(path)")
+        exit(1)
+    }
+    do {
+        let inspection = try SecureBootInspector.inspect(efiImage: URL(fileURLWithPath: path))
+        print("镜像  : \(path)")
+        print("状态  : \(inspection.summary)")
+        for item in inspection.found { print("  ✓ \(item)") }
+        for item in inspection.missing { print("  ✗ \(item)") }
+        if let sha = inspection.certificateSHA256 {
+            print("证书  : \(inspection.certificateSize ?? 0) 字节")
+            print("SHA256: \(sha)")
+        }
+        print("")
+        print("说明  : 首次在开启 Secure Boot 的机器上启动仍需在 MokManager")
+        print("        界面注册一次该证书；注册后同一台机器永久免操作。")
+        print("        要彻底免按键，请把这枚证书写入该机固件 db。")
+        exit(inspection.isComplete ? 0 : 3)
+    } catch {
+        print("解析失败：\(error.localizedDescription)")
+        exit(1)
+    }
 
 case "assets":
     guard let assets = cachedAssets() else {
@@ -460,9 +582,10 @@ default:
       ventoymac-cli self-test              运行核心算法与脚本自检
       ventoymac-cli disks                 列出外接磁盘及可选状态
       ventoymac-cli plan <diskN> [MiB]    计算指定磁盘的 GPT 布局
-      ventoymac-cli script <diskN>        输出该盘的审计模式安装脚本
+      ventoymac-cli script <diskN>        输出该盘的审计模式安装脚本（可加 --secure-boot）
       ventoymac-cli live-script <diskN>   输出实时安装脚本（只打印，不执行；供 sudo 使用）
       ventoymac-cli rehearse-script <diskN> <bytes>  输出虚拟盘演练脚本（只打印，不执行）
+      ventoymac-cli secure-boot-check [ventoy.disk.img]  离线校验镜像内的 shim / MokManager / 证书
       ventoymac-cli probe-script <diskN>  输出 0 字节写打开 + 对齐读 + 分区通道探针（只打印，不执行）
       ventoymac-cli group-setup-script    输出 operator 组设置脚本（已弃用，仅供诊断）
       ventoymac-cli demo-script           输出合成磁盘的完整审计脚本（可 bash -n 校验）

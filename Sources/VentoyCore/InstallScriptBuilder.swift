@@ -27,19 +27,29 @@ public struct InstallPlan: Sendable {
     public let volumeLabel: String
     public let isoPaths: [String]
     public let mode: ScriptMode
+    public let secureBoot: SecureBootOptions
+    /// Result of parsing the cached `ventoy.disk.img` on the host. Optional:
+    /// the generated script still verifies the written partition, so a plan
+    /// built without an inspection remains valid (just without fingerprint
+    /// pinning).
+    public let secureBootInspection: SecureBootInspection?
 
     public init(device: DiskDevice,
                 layout: VentoyLayout,
                 assets: BootAssets,
                 volumeLabel: String = VentoySpec.defaultVolumeLabel,
                 isoPaths: [String] = [],
-                mode: ScriptMode = .audit) {
+                mode: ScriptMode = .audit,
+                secureBoot: SecureBootOptions = SecureBootOptions(),
+                secureBootInspection: SecureBootInspection? = nil) {
         self.device = device
         self.layout = layout
         self.assets = assets
         self.volumeLabel = volumeLabel
         self.isoPaths = isoPaths
         self.mode = mode
+        self.secureBoot = secureBoot
+        self.secureBootInspection = secureBootInspection
     }
 }
 
@@ -49,6 +59,10 @@ public enum InstallPlanError: Error, LocalizedError, Equatable {
     case invalidVolumeLabel
     case missingISO(String)
     case unsupportedSectorSize(UInt64)
+    /// Requested Secure Boot support, but the cached VTOYEFI image provably
+    /// lacks shim / MokManager / the enrollment certificate — enrollment would
+    /// dead-end at "0x1a Security Violation" with no way forward.
+    case secureBootIncomplete([String])
 
     public var errorDescription: String? {
         switch self {
@@ -62,6 +76,9 @@ public enum InstallPlanError: Error, LocalizedError, Equatable {
             return "镜像文件不存在：\(path)"
         case .unsupportedSectorSize(let size):
             return "不支持 \(size) 字节扇区设备（Ventoy 要求 512 字节）。"
+        case .secureBootIncomplete(let issues):
+            return "已勾选 Secure Boot，但引导资源不完整：" + issues.joined(separator: "、")
+                + "。请重新下载官方发布包（缺少 MokManager 时，固件只会停在 0x1a，无法注册密钥）。"
         }
     }
 }
@@ -85,6 +102,13 @@ public extension InstallPlan {
         }
         for path in isoPaths where !FileManager.default.fileExists(atPath: path) {
             throw InstallPlanError.missingISO(path)
+        }
+        // Known-bad is fatal; unknown (unparseable image) is not — the
+        // generated script re-checks the partition it just wrote.
+        if secureBoot.enabled,
+           let inspection = secureBootInspection,
+           inspection.status == .incomplete {
+            throw InstallPlanError.secureBootIncomplete(inspection.missing)
         }
     }
 }
@@ -328,6 +352,95 @@ echo "  ✓ 字节 92=0x22、17908=0x23、MBR 签名 0x55AA"
         add("写入官方 VTOYEFI 分区镜像（GRUB2 + x86/IA32/ARM64 EFI）",
             "vtoy_raw_write \(q(assets.efiImage)) \(efiCount) \(part2LBA)")
 
+        // ── Secure Boot ────────────────────────────────────────────────────
+        // Ventoy's chain is firmware db → Microsoft-signed shim →
+        // Ventoy-signed loader → grub. The second hop is never in the
+        // firmware db, so the FIRST boot on every new machine must enroll
+        // ENROLL_THIS_KEY_IN_MOKMANAGER.cer through MokManager. That single
+        // registration cannot be removed from the stick side (the trust
+        // anchor lives in the target firmware) — but two things can go wrong
+        // and both are fixed here:
+        //   1. a truncated / partially written VTOYEFI loses mmx64.efi, and
+        //      then 0x1a becomes a dead end instead of an enrollment screen;
+        //   2. the certificate is buried inside a 32 MiB FAT partition that
+        //      MokManager has to browse in a tiny non-GUI file picker.
+        // So: verify the chain from the partition we just wrote (read-only, to
+        // avoid macOS metadata litter) and stage the certificate where the
+        // firmware-side picker can reach it in two keystrokes.
+        let part2Dev = dev + "s2"
+        let part1Dev = dev + "s1"
+        let sbDirectory = SecureBootSpec.dataDirectory
+        let certName = SecureBootSpec.certificateName
+        let readmePath = "\(sbDirectory)/\(SecureBootSpec.readmeName)"
+        let expectedCertSHA = plan.secureBootInspection?.certificateSHA256
+
+        if plan.secureBoot.enabled {
+            let fingerprintCheck: String
+            if let expected = expectedCertSHA {
+                fingerprintCheck = """
+if [ "$VTOY_SB_SHA" != \(q(expected)) ]; then
+  echo "校验失败：证书指纹 $VTOY_SB_SHA"
+  echo "         与制作前从官方镜像算出的 \(expected) 不一致"
+  echo "说明 EFI 镜像未完整写入（该分区已被清空，请重新执行一次安装）。"
+  /usr/sbin/diskutil unmount force \(q(part2Dev)) >/dev/null 2>&1 || true
+  exit 1
+fi
+"""
+            } else {
+                fingerprintCheck = "# 未能在制作前解析镜像，跳过指纹比对（仅记录本次实际值）\n"
+            }
+
+            add("校验 VTOYEFI 内的 Secure Boot 组件（shim / MokManager / 证书）", """
+# 只读挂载：macOS 挂载 FAT 会顺手写入 ._* 与 .fseventsd，会污染引导分区。
+# 写完整盘镜像后 DiskArbitration 可能已经把它读写挂载了，所以先强制卸载，
+# 再自己用 readOnly 挂一次，确保这次校验不会给分区添一个字节。
+/usr/sbin/diskutil unmount force \(q(part2Dev)) >/dev/null 2>&1 || true
+VTOY_EFI_MP="$(ventoy_mount_point \(q(part2Dev)))"
+if [ -z "$VTOY_EFI_MP" ]; then
+  for i in 1 2 3 4 5 6 7 8; do
+    /usr/sbin/diskutil mount readOnly nobrowse \(q(part2Dev)) >/dev/null 2>&1 || true
+    VTOY_EFI_MP="$(ventoy_mount_point \(q(part2Dev)))"
+    [ -n "$VTOY_EFI_MP" ] && break
+    /bin/sleep 1
+  done
+fi
+[ -n "$VTOY_EFI_MP" ] || { echo "错误：无法只读挂载 \(part2Dev)，无法校验 Secure Boot 组件"; exit 1; }
+
+VTOY_SB_MISSING=""
+VTOY_SB_CERT="$(/usr/bin/find "$VTOY_EFI_MP" -maxdepth 1 -type f -iname 'enroll_this_key_in_mokmanager.cer' -print -quit 2>/dev/null || true)"
+[ -n "$VTOY_SB_CERT" ] || VTOY_SB_MISSING="$VTOY_SB_MISSING \(certName)"
+if ! vty_sb_has "$VTOY_EFI_MP/EFI/BOOT" 'bootx64.efi' \\
+   && ! vty_sb_has "$VTOY_EFI_MP/EFI/BOOT" 'bootia32.efi'; then
+  VTOY_SB_MISSING="$VTOY_SB_MISSING EFI/BOOT/BOOTX64.EFI（shim）"
+fi
+if ! vty_sb_has "$VTOY_EFI_MP/EFI/BOOT" 'mmx64.efi' \\
+   && ! vty_sb_has "$VTOY_EFI_MP/EFI/BOOT" 'mmia32.efi'; then
+  VTOY_SB_MISSING="$VTOY_SB_MISSING EFI/BOOT/mmx64.efi（MokManager）"
+fi
+
+if [ -n "$VTOY_SB_MISSING" ]; then
+  echo "=================================================================="
+  echo "拒绝继续：VTOYEFI 分区缺少 Secure Boot 必需的组件："
+  for m in $VTOY_SB_MISSING; do echo "  · $m"; done
+  echo ""
+  echo "缺少 MokManager 时，固件只会停在 0x1a 而无法进入注册界面，"
+  echo "这台机器将永远启动不了本盘。请重新下载官方发布包后重新制作。"
+  echo "本次安装已中止：U 盘的引导分区是完整的，数据分区尚未格式化。"
+  echo "=================================================================="
+  /usr/sbin/diskutil unmount force \(q(part2Dev)) >/dev/null 2>&1 || true
+  exit 1
+fi
+
+VTOY_SB_SHA="$(/usr/bin/shasum -a 256 "$VTOY_SB_CERT" | /usr/bin/awk '{print $1}')"
+\(fingerprintCheck)
+/bin/cp "$VTOY_SB_CERT" "$VTOY_STAGE/enroll.cer"
+/usr/sbin/diskutil unmount force \(q(part2Dev)) >/dev/null 2>&1 || true
+echo "  ✓ shim + MokManager + 证书齐全"
+echo "  ✓ 证书 SHA-256：$VTOY_SB_SHA"
+echo "  ℹ 首次在该机型启动时仍需在蓝色 MokManager 界面注册一次（只需一次）"
+""", false)
+        }
+
         add("格式化分区 1 为 exFAT（卷标 \(label)）", """
 vtoy_unmount
 /sbin/newfs_exfat -v \(q(label)) -c \(cluster) \(q(p1))
@@ -345,6 +458,93 @@ fi
 echo "挂载点：$MP"
 """, false)
 
+        if plan.secureBoot.enabled {
+            let policyBlock: String
+            if plan.secureBoot.policy == .strict {
+                policyBlock = """
+/bin/mkdir -p "$MP/ventoy"
+if [ -e "$MP/\(SecureBootSpec.pluginPath)" ]; then
+  echo "  ⚠ 已存在 \(SecureBootSpec.pluginPath)，未覆盖；请手动加入 VTOY_SECURE_BOOT_POLICY"
+else
+  cat > "$MP/\(SecureBootSpec.pluginPath)" <<'VTOYJSON'
+{
+  "control": [
+    { "VTOY_SECURE_BOOT_POLICY": "1" }
+  ]
+}
+VTOYJSON
+  echo "  ✓ 已写入 \(SecureBootSpec.pluginPath)：VTOY_SECURE_BOOT_POLICY=1（遵循固件策略）"
+fi
+"""
+            } else {
+                policyBlock = "echo \"  ℹ 策略：完全绕过验证（Ventoy 默认，VTOY_SECURE_BOOT_POLICY 未设置）\"\n"
+            }
+
+            add("写入 Secure Boot 注册材料与说明（数据分区 \(sbDirectory)/）", """
+MP="$(ventoy_mount_point \(q(part1Dev)))"
+if [ -z "$MP" ]; then
+  MP="$(/usr/bin/mktemp -d -t ventoy-mount)"
+  /sbin/mount -t exfat \(q(part1Dev)) "$MP" || { echo "错误：无法挂载 Ventoy 数据分区"; exit 1; }
+fi
+/bin/mkdir -p "$MP/\(sbDirectory)"
+/bin/cp "$VTOY_STAGE/enroll.cer" "$MP/\(sbDirectory)/\(certName)"
+# 根目录再放一份：MokManager 的文件浏览器从卷根开始，少翻两层目录。
+/bin/cp "$VTOY_STAGE/enroll.cer" "$MP/\(certName)"
+cat > "$MP/\(readmePath)" <<VTOYREADME
+Ventoy Secure Boot 注册说明
+===========================
+
+本 U 盘已启用 UEFI Secure Boot 支持。首次在一台新电脑上启动时，固件会先运行
+Ventoy 借用的 shim（微软签名的 Rocky Linux shim），而接着运行的 Ventoy 引导器
+是用 Ventoy 自己的密钥签名的 —— 这枚密钥不在固件的信任库里，所以必须由你
+在目标电脑上注册一次。
+
+【只需注册一次】
+注册后，同一台电脑上任何使用同一枚 Ventoy 证书的 U 盘都不再询问。
+证书指纹（SHA-256）：
+  $VTOY_SB_SHA
+
+操作步骤
+--------
+1. 开机进入启动菜单，选择名称里带 UEFI 的那一项（如 "UEFI: SanDisk ..."）。
+2. 出现蓝底 "Verification failed: (0x1a) Security Violation" 时按回车。
+3. 在 MokManager 菜单选 "Enroll key from disk"（从磁盘注册密钥）。
+4. 选择本盘根目录的 \(certName)，或 \(sbDirectory)/ 目录下的同名文件。
+5. 选 "Enroll" 确认，然后 "Reboot" 重启，再从 U 盘启动即可进入 Ventoy。
+
+【想彻底不再出现这个界面】
+把上面这枚证书一次性写入电脑固件的 db（信任库）。多数商用机在
+BIOS → Security → Secure Boot → Key Management → Enroll/Append Key，
+或支持 "Enroll EFI Image"。写入后，任何 Ventoy 盘都可直接启动、无需按键；
+企业环境可由 IT 在装机阶段预置该证书，并按上面的指纹核对。
+
+【蓝屏只有 0x1a、没有注册菜单】
+说明 VTOYEFI 分区缺少 mmx64.efi（MokManager），或 EFI 镜像写入不完整。
+请重新制作启动盘；不要继续尝试在这台机器上启动。
+
+【注意】以 "._" 开头的同名文件是 macOS 在 exFAT 上生成的元数据残留，
+不是证书本身；本盘已自动清理，若你后来从访达往盘里拖过东西又出现了它，
+请忽略它、选不带前缀的那个。
+
+（本文件由 VentoyMac 生成，证书取自 Ventoy 官方发布包。）
+VTOYREADME
+\(policyBlock)
+# macOS 的 exFAT 实现会为每个新建文件/目录写一份 "._" 伴生元数据。MokManager
+# 的文件列表会把它们一并列出且排在前排，很容易选错成 4096 字节的假证书。
+# 这里只清理本次安装自己创建的那些条目（路径全部写死，不使用通配符）。
+/bin/rm -f "$MP/._\(certName)" \
+          "$MP/\(sbDirectory)/._\(certName)" \
+          "$MP/\(sbDirectory)/._\(SecureBootSpec.readmeName)" \
+          "$MP/ventoy/._ventoy.json" 2>/dev/null || true
+/bin/rm -rf "$MP/._\(sbDirectory)" 2>/dev/null || true
+[ ! -d "$MP/ventoy" ] || /bin/rm -rf "$MP/._ventoy" 2>/dev/null || true
+echo "  ✓ 注册材料：$MP/\(sbDirectory)/\(certName)"
+echo "  ✓ 根目录副本：$MP/\(certName)"
+echo "  ✓ 中文说明：$MP/\(readmePath)"
+""", false)
+        }
+
+
         for path in plan.isoPaths {
             let name = URL(fileURLWithPath: path).lastPathComponent
             // `cp src dir/` preserves the source basename and needs no name quoting.
@@ -359,12 +559,22 @@ fi
 """, false)
         }
 
+        let secureBootEpilogue = plan.secureBoot.enabled ? """
+
+echo ""
+echo "Secure Boot：已启用（策略 \(plan.secureBoot.policy.rawValue)）"
+echo "  证书指纹 $VTOY_SB_SHA"
+echo "  注册材料已放在数据分区根目录与 \(SecureBootSpec.dataDirectory)/ 目录"
+echo "  首次在目标机启动：蓝屏 0x1a → 回车 → Enroll key from disk → 选该证书 → Reboot"
+echo "  想彻底免按键：把这枚证书一次性写入该机固件 db（BIOS Secure Boot 密钥管理）"
+""" : ""
+
         add("同步并输出完成信息", """
 sync
 echo "Ventoy \(assets.version) 已写入 \(dev)"
 echo "VTOYEFI 分区起始 LBA：$VTOY_PART2_LBA"
 /usr/sbin/diskutil list \(q(dev)) || true
-/usr/sbin/gpt -r show -l \(q(dev)) || true
+/usr/sbin/gpt -r show -l \(q(dev)) || true\(secureBootEpilogue)
 """, false)
 
         let steps = rawSteps.enumerated().map {
@@ -391,6 +601,14 @@ echo "VTOYEFI 分区起始 LBA：$VTOY_PART2_LBA"
         out.append("# Layout : GPT / part1 LBA \(plan.layout.part1Start) + \(plan.layout.part1Sectors), part2 LBA \(plan.layout.part2Start) + \(plan.layout.part2Sectors)")
         out.append("# Build  : \(VentoyBuild.id)  (install script r\(VentoyBuild.scriptRevision))")
         out.append("# Source : https://github.com/ventoy/Ventoy  (INSTALL/tool/ventoy_lib.sh)")
+        if plan.secureBoot.enabled {
+            let cert = plan.secureBootInspection?.certificateSHA256 ?? "（未在制作前解析）"
+            out.append("# SecureBoot: ENABLED  policy=\(plan.secureBoot.policy.rawValue)  cert-sha256=\(cert)")
+            out.append("# SecureBoot: 首次在目标机启动仍需在 MokManager 界面注册一次证书；")
+            out.append("# SecureBoot: 注册后同一台机器永久免操作，证书与说明写在数据分区 SecureBoot/。")
+        } else {
+            out.append("# SecureBoot: disabled（U 盘仍含完整 shim 链，固件开启 Secure Boot 时会提示注册）")
+        }
         out.append("# =====================================================================")
         out.append("# 警告：本脚本会彻底清空目标磁盘上的所有数据，请在执行前逐条审阅。")
         out.append("")
@@ -439,13 +657,28 @@ echo "分区通道：diskutil partitionDisk -noEFI（gpt 写命令在 SIP 开启
         out.append("  return 1")
         out.append("}")
         out.append("")
+        if plan.secureBoot.enabled {
+            // Case-insensitive single-directory lookup, used to verify the
+            // Secure Boot chain inside the freshly written VTOYEFI partition.
+            // Deliberately avoids `find ... | grep -q`: with `pipefail` an
+            // early-exiting `grep -q` kills `find` via SIGPIPE and the pipeline
+            // reports failure even when the file exists.
+            out.append("# $1 = directory, $2 = file name (case-insensitive); 0 when present")
+            out.append("vty_sb_has() {")
+            out.append("  [ -d \"$1\" ] || return 1")
+            out.append("  local hit")
+            out.append("  hit=\"$(/usr/bin/find \"$1\" -maxdepth 1 -type f -iname \"$2\" -print -quit 2>/dev/null)\"")
+            out.append("  [ -n \"$hit\" ]")
+            out.append("}")
+            out.append("")
+        }
         // Staging area for sub-sector byte patches. A regular file accepts
         // arbitrary byte offsets; /dev/rdisk* does not. Keeping every staged
         // file in one mktemp directory also makes cleanup deterministic.
         out.append("VTOY_STAGE=\"$(/usr/bin/mktemp -d -t vtoymac-stage)\"")
         out.append("cleanup_stage() {")
         out.append("  /bin/rm -f \"$VTOY_STAGE/mbr.bin\" \"$VTOY_STAGE/core.bin\" \"$VTOY_STAGE/uuid.bin\" \\")
-        out.append("           \"$VTOY_STAGE/verify.bin\" \"$VTOY_STAGE/verify-core.bin\"")
+        out.append("           \"$VTOY_STAGE/verify.bin\" \"$VTOY_STAGE/verify-core.bin\" \"$VTOY_STAGE/enroll.cer\"")
         out.append("  /bin/rmdir \"$VTOY_STAGE\" 2>/dev/null || true")
         out.append("}")
         out.append("trap cleanup_stage EXIT")

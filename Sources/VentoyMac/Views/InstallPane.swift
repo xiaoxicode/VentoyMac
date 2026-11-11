@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import VentoyCore
 
 struct InstallPane: View {
@@ -13,6 +14,7 @@ struct InstallPane: View {
                     ReadinessCard()
                     PermissionCard()
                     ConfigurationCard()
+                    SecureBootCard()
                     if let generated = state.generated {
                         PlanCard(script: generated)
                         ScriptPreviewCard(text: generated.text, expanded: $showScript)
@@ -271,6 +273,157 @@ private struct ConfigurationCard: View {
     }
 }
 
+// MARK: - Secure Boot
+
+/// The honest version of the "enable Secure Boot" checkbox.
+///
+/// Ventoy's bootloader is signed with Ventoy's own key, so the firmware cannot
+/// trust it; the Microsoft-signed shim hands over to MokManager on the first
+/// boot of every machine. That registration is a firmware-side trust decision
+/// and cannot be pre-authorised by the stick maker. What this card does is make
+/// the unavoidable step a two-keystroke one, verify that the chain even exists
+/// (a missing MokManager turns the prompt into a dead end), and print the
+/// fingerprint needed to pre-provision the certificate into a firmware db —
+/// which is the only zero-touch path.
+private struct SecureBootCard: View {
+    @EnvironmentObject private var state: AppState
+
+    var body: some View {
+        SectionCard("UEFI Secure Boot",
+                    subtitle: "对应官方 Ventoy2Disk.sh 的 -s / -S。Ventoy 引导器用自签密钥，固件默认不信任它。") {
+            Toggle(isOn: Binding(get: { state.secureBootEnabled },
+                                 set: { state.setSecureBootEnabled($0) })) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("启用 Secure Boot 支持")
+                        .font(.callout.weight(.medium))
+                    Text("制作时校验 shim / MokManager / 证书，并把注册材料放到数据分区（2 次按键即可完成注册）")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .toggleStyle(.switch)
+
+            if state.secureBootEnabled {
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    Text("策略")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 60, alignment: .leading)
+                    Picker("", selection: Binding(get: { state.secureBootPolicy },
+                                                  set: { state.setSecureBootPolicy($0) })) {
+                        ForEach(SecureBootPolicy.allCases) { policy in
+                            Text(policy.title).tag(policy)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: 280)
+                    .controlSize(.small)
+                    Spacer(minLength: 0)
+                }
+                Text(state.secureBootPolicy.detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            componentRow
+            fingerprintRow
+
+            VStack(alignment: .leading, spacing: 3) {
+                note("1", "首次在一台新电脑上启动，仍会出现一次蓝底 “Verification failed: (0x1a) Security Violation”。这不是 BIOS 少配了什么，而是固件在问“要不要信任 Ventoy 的密钥”。回车 → Enroll key from disk → 选数据分区里的证书 → Enroll → Reboot。")
+                note("2", "注册只做一次：同一台电脑上，任何使用同一枚证书的 Ventoy 盘都不再询问；重做启动盘也不会失效。")
+                note("3", "想彻底免按键，只能把这枚证书写进该机固件 db（BIOS → Secure Boot → 密钥管理 → Enroll / Append Key，或支持 Enroll EFI Image 的机型）。企业环境建议 IT 出厂预置，按上面的指纹核对。")
+                note("4", "从 Ventoy 1.1.13 起官方更换了新密钥（UEFI CA 2023 问题），跨该版本升级后需要在每台机器上重新注册一次。")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var componentRow: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: iconName)
+                .foregroundStyle(iconColor)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(state.secureBootInspection?.summary ?? "尚未检查（需要先安装引导资源）")
+                    .font(.caption.weight(.medium))
+                if let found = state.secureBootInspection?.found, !found.isEmpty {
+                    Text(found.joined(separator: " · "))
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+            Spacer(minLength: 0)
+            Button {
+                state.refreshSecureBootInspection()
+            } label: {
+                Label("重新检查", systemImage: "arrow.clockwise")
+                    .font(.caption2)
+            }
+            .buttonStyle(.borderless)
+            .disabled(state.assets == nil)
+        }
+    }
+
+    private var fingerprintRow: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "key.horizontal")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("证书指纹")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(state.secureBootInspection?.fingerprintDisplay ?? "—")
+                .font(.caption2.monospaced())
+                .textSelection(.enabled)
+            if let hash = state.secureBootInspection?.certificateSHA256 {
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(hash, forType: .string)
+                } label: {
+                    Label("复制", systemImage: "doc.on.doc")
+                        .font(.caption2)
+                }
+                .buttonStyle(.borderless)
+                .help("写入固件 db 或做企业白名单时使用")
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var iconName: String {
+        switch state.secureBootInspection?.status {
+        case .complete: return "checkmark.shield.fill"
+        case .incomplete: return "xmark.shield.fill"
+        case .unavailable: return "questionmark.circle"
+        case .none: return "shield"
+        }
+    }
+
+    private var iconColor: Color {
+        switch state.secureBootInspection?.status {
+        case .complete: return .green
+        case .incomplete: return .red
+        case .unavailable: return .orange
+        case .none: return .secondary
+        }
+    }
+
+    private func note(_ number: String, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 7) {
+            Text(number)
+                .font(.caption2.monospaced().weight(.bold))
+                .foregroundStyle(.tint)
+                .frame(width: 12)
+            Text(text)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
+    }
+}
+
 // MARK: - Plan
 
 private struct PlanCard: View {
@@ -459,6 +612,9 @@ struct ConfirmSheet: View {
                     bullet("删除磁盘上所有现有分区与分区表")
                     bullet("重建 GPT：exFAT 数据分区 + 32 MiB VTOYEFI")
                     bullet("写入 MBR 引导代码、Legacy BIOS GRUB core 与官方 EFI 镜像")
+                    if state.secureBootEnabled {
+                        bullet("只读校验 VTOYEFI 内的 Secure Boot 组件，并写入证书与注册说明")
+                    }
                     bullet("格式化数据分区并复制 \(state.isoPaths.count) 个镜像文件")
                 }
 
