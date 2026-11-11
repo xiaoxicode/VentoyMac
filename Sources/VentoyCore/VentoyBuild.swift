@@ -11,7 +11,7 @@ import Foundation
 /// app detect that it is stale and ask to be restarted.
 public enum VentoyBuild {
     /// Bump on every .app rebuild that changes behaviour.
-    public static let id = "2026.11.11-b9"
+    public static let id = "2026.11.11-b10"
 
     /// Bump only when the generated Bash script changes.
     /// r3 = all raw-device writes are 512-byte sector aligned (fixes EINVAL).

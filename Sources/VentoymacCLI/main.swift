@@ -94,6 +94,24 @@ func fakeAssets() throws -> BootAssets {
     return BootAssets(version: "self-test", directory: dir.path)
 }
 
+
+/// Top-level `try` in main.swift aborts the process with a Swift fatal error
+/// (exit 133 + a dump), which reads as a crash to users piping this CLI. Layout
+/// failures are expected inputs (disk too small, 4Kn sector size), so they must
+/// exit(1) with the localized message instead.
+func layoutOrDie(totalBytes: UInt64,
+                 deviceSectorSize: UInt64 = VentoySpec.sectorSize,
+                 reservedMiB: UInt64 = 0) -> VentoyLayout {
+    do {
+        return try VentoyLayoutCalculator.gpt(totalBytes: totalBytes,
+                                              deviceSectorSize: deviceSectorSize,
+                                              reservedMiB: reservedMiB)
+    } catch {
+        print("布局计算失败：\(error.localizedDescription)")
+        exit(1)
+    }
+}
+
 func sampleDevice(internalDisk: Bool = false) -> DiskDevice {
     DiskDevice(bsdName: internalDisk ? "disk0" : "disk9",
                deviceNode: internalDisk ? "/dev/disk0" : "/dev/disk9",
@@ -300,9 +318,9 @@ case "plan":
         exit(1)
     }
     let sectorSize = device.deviceBlockSize > 0 ? device.deviceBlockSize : 512
-    let layout = try VentoyLayoutCalculator.gpt(totalBytes: device.totalBytes,
-                                                deviceSectorSize: sectorSize,
-                                                reservedMiB: reserved)
+    let layout = layoutOrDie(totalBytes: device.totalBytes,
+                             deviceSectorSize: sectorSize,
+                             reservedMiB: reserved)
     print("设备: /dev/\(device.bsdName)  \(device.displayName)  \(device.sizeDescription)")
     for line in layout.summaryLines { print(line) }
 
@@ -321,8 +339,7 @@ case "script":
         exit(1)
     }
     let sectorSize = device.deviceBlockSize > 0 ? device.deviceBlockSize : 512
-    let layout = try VentoyLayoutCalculator.gpt(totalBytes: device.totalBytes,
-                                                deviceSectorSize: sectorSize)
+    let layout = layoutOrDie(totalBytes: device.totalBytes, deviceSectorSize: sectorSize)
     let plan = InstallPlan(device: device, layout: layout, assets: assets, mode: .audit,
                            secureBoot: secureBootOptions(),
                            secureBootInspection: secureBootInspection(for: assets))
@@ -369,8 +386,7 @@ case "live-script":
         exit(1)
     }
     let sectorSize = device.deviceBlockSize > 0 ? device.deviceBlockSize : 512
-    let layout = try VentoyLayoutCalculator.gpt(totalBytes: device.totalBytes,
-                                                deviceSectorSize: sectorSize)
+    let layout = layoutOrDie(totalBytes: device.totalBytes, deviceSectorSize: sectorSize)
     let plan = InstallPlan(device: device, layout: layout, assets: assets, mode: .live,
                            secureBoot: secureBootOptions(),
                            secureBootInspection: secureBootInspection(for: assets))
@@ -397,7 +413,7 @@ case "rehearse-script":
         print("尚未安装引导资源。请先在 VentoyMac 应用中下载或导入官方 tar.gz。")
         exit(1)
     }
-    let layout = try VentoyLayoutCalculator.gpt(totalBytes: bytes)
+    let layout = layoutOrDie(totalBytes: bytes)
     let device = DiskDevice(bsdName: name,
                             deviceNode: "/dev/" + name,
                             mediaName: "Rehearsal Disk Image",
