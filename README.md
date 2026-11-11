@@ -363,7 +363,70 @@ ventoymac-cli group-setup-script        # 【已弃用】operator 组诊断脚�
 
 ---
 
-## 11. 参考
+## 11. `Verification failed: (0x1a) Security Violation` 排查（必读）
+
+**这个报错不是 Ventoy 坏了，也不是用本工具制作盘做错了。** 它是 UEFI Secure Boot 的正常安全机制，官方 Windows / Linux 安装器做出来的盘同样会遇到。任何制作工具都改变不了这一点，原因如下。
+
+### 为什么会出现
+
+开启 Secure Boot 的电脑只会执行「固件信任库（db）里有签名」的引导程序。Ventoy 的启动链是：
+
+```
+固件 db ──验证──▶ shim（微软签名 ✓）──验证──▶ grubx64.efi（Ventoy 自签 ✗）
+```
+
+- Ventoy 的 GRUB 是 GPLv3 开源代码，微软不会对开源引导器签发 UEFI 签名，所以 Ventoy 借用了 Rocky Linux 的 **shim**（有微软签名，第一跳合法通过）。
+- shim 之后要加载的 `grubx64.efi` 用 **Ventoy 自己的密钥**签名，这把钥匙不在你电脑的固件 db 里。
+- 于是 shim 弹出 **MokManager** 注册界面让你手动确认「是否信任这把钥匙」，屏幕上先闪现的那行 `Verification failed: (0x1a) Security Violation` 就是这次"暂时不认识"的记录。**这是设计行为，不是错误**——它正是 Secure Boot「首次使用需人确认」的环节。
+
+信任根在**目标电脑的固件**里、不在 U 盘上，所以没有任何制作端软件能"做一张盘就免掉这次确认"（官方文档：`https://www.ventoy.net/en/doc_secure.html`，本仓库 `SECURE_BOOT.md` 有完整分析）。
+
+### 解决方案（三选一）
+
+**方案 A：现场注册一次（推荐，每台电脑只需一次）**
+
+看到 `0x1a` 后**不要关机**，屏幕下方会有 MokManager 蓝色菜单（"Perform MOK management"）。用键盘操作：
+
+1. 选 **Enroll Key from Disk**（从磁盘注册密钥）→ 选择 Ventoy 分区；
+2. 进入 `SecureBoot/` 目录（本工具制作的盘把它放在卷根目录也放了一份），选择 **`ENROLL_THIS_KEY_IN_MOKMANAGER.cer`**（约 1420 字节；**不要**选 `._` 开头或几 KB 的伴生假文件）；
+3. 确认指纹（本工具制作的盘会把 SHA-256 写在数据分区 `SecureBoot/SECURE-BOOT-README.txt` 里）→ **Enroll** → 重启。
+
+此后同一台电脑永久免操作。制作时勾选「启用 Secure Boot 支持」，本工具会自动预校验组件齐全并把证书和中文说明放进 U 盘，让上面三步变成"回车 + 选文件 + Enroll"。
+
+⚠️ 若蓝屏只有 `0x1a` 一行、**没有** MokManager 菜单且直接弹回 BIOS，说明盘里缺 MokManager（`mmx64.efi`）——用本工具制作时缺件会被硬性拦截（见 `SECURE_BOOT.md`），此时应更换 Ventoy 官方发布包重新制作。
+
+**方案 B：BIOS 里临时关闭 Secure Boot**
+
+BIOS → Security / Boot → Secure Boot → Disabled。最快，但整台机器的启动防护也随之关闭；部分品牌（如某些 OEM 预装 Win11 的机器）需要先在 BIOS 设置管理员密码才能改此项。
+
+**方案 C：把证书预置进固件 db（彻底免按键，适合企业批量）**
+
+一次性把 `ENROLL_THIS_KEY_IN_MOKMANAGER.cer` 导入目标机固件的 **Signature Database (db)**：BIOS → Security / Key Management → Custom Secure Boot Keys → Add to db。之后每次启动全自动，MokManager 不再出现。这是唯一"零交互"路径，代价是需要在每台机器上操作一次（可用厂商工具批量推送）。
+
+### 常见误解
+
+| 误解 | 事实 |
+|---|---|
+| "在 BIOS 里找到对应签名选一下就好" | `0x1a` 界面是 shim/MokManager 画的，不是 BIOS 菜单，BIOS 里没有"选择签名"选项 |
+| "换个制作工具就不会报 0x1a" | 官方 Ventoy2Disk（Windows/Linux）做的盘同样会弹；区别只在这一次确认的体验 |
+| "证书注册后换台电脑还要再来一次" | 对——每台开 Secure Boot 的电脑各注册一次（或方案 C 预置固件） |
+| "U 盘上的注册材料就是问题本身" | 注册材料（`.cer`）只是"申请入库的钥匙副本"，装不装盘都能启动，装了只是让注册更快 |
+
+---
+
+## 12. 许可与版权
+
+本仓库是 Ventoy 官方安装器在 macOS/Apple Silicon 上的移植实现，逐行复刻其磁盘布局算法并复用其发布的引导二进制，因此**整体按 GNU GPLv3 分发**（与上游 Ventoy 相同），全文见仓库根目录 [`LICENSE`](LICENSE)。
+
+- **Copyright (C) 2026 VentoyMac contributors**（本仓库新增的 Swift 安装器代码）
+- **Copyright (C) 2020-2026 Ventoy contributors**（被移植的布局算法与复用的引导镜像；本仓库不包含其源码修改，运行时从官方 Release 获取并经 SHA-256 校验，见第 9 节）
+- 复用镜像内部组件各自的许可证随官方发布包一并分发：GNU GRUB2（GPLv3）、shim / MokManager（源自 Rocky Linux，含 MIT 与 GPLv2 组件）、exFAT 工具（GPLv2）等。
+
+你可以自由地复制、修改、再分发本项目，条件是以 GPLv3 公开完整对应源码并保留本声明。**关于 Mac App Store**：GPLv3 第 10 节禁止对下游施加额外限制，而 MAS 的 DRM 与强制商店更新机制构成额外限制，因此本类 GPL 软件不适合通过 Mac App Store 分发；推荐的分发方式是 GitHub Release + Developer ID 签名 + Apple 公证（notarytool），同样能通过 Gatekeeper 直接安装。
+
+---
+
+## 13. 参考
 
 - 磁盘布局：`https://www.ventoy.net/en/doc_disk_layout_gpt.html`
 - 官方构建：`DOC/BuildVentoyFromSource.txt`、`INSTALL/ventoy_pack.sh`
